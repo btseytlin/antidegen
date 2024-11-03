@@ -12,6 +12,7 @@ from threading import Thread
 import google.generativeai as genai
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -309,6 +310,10 @@ async def error_handler(update: object, context) -> None:
             f"<pre>{html.escape(tb_string[-300:])}</pre>",
         ],
     )
+
+    if isinstance(context.error, TelegramError):
+        logging.error(f"Telegram error received, killing process.")
+        exit(1)
 
 
 class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
