@@ -1,11 +1,21 @@
 import asyncio
+import html
+import json
 import logging
 import os
+import traceback
 from collections import Counter
 
 import google.generativeai as genai
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -20,79 +30,202 @@ WHITELIST_IDS = [int(ADMIN_ID), int(TARGET_GROUP_ID)] + [
 
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(
-    "gemini-1.5-flash-002",
-    system_instruction="""You are a moderator bot for a Telegram channel comments. 
-You will be shown a user comment. Answer with "spam" or "no_spam". Just this string and nothing else.
-""",
-    generation_config=genai.GenerationConfig(
-        max_output_tokens=20,
-    ),
-)
+
+
+system_instruction = """
+You are an anti-spam moderator bot for a Telegram channel comments. You will be shown comment info from Telegram API as a json/dict. Classify the comment as spam or not spam.
+
+Categories of spam:
+-   Links aiming to sell something.
+-   Bait messages luring a user to check the spammer account profile.
+-   Comment posted after publication of a post impossibly quickly for a human. The difference between post date and comment date is stored in the "comment_delay_seconds" field.
+-   Content unrelated to the post the comment is replying, "reply_to_message" field contains a sample of the post if present.
+-   Porn, prostitution, gambling, crypto/NFT, get rich quick schemes and such.
+Anything else is not spam. When in doubt, classify as not spam. We don't want to ruin the experience for legitimate commenters.
+
+Answer format: 
+1. If spam: `{"why": "explanation", "spam": true}`. "why" should explain your reason in 4 words or less.
+2. If not spam: `{"spam": false}`
+Output as plain string, no formatting. For example:{"why": "bait link", "spam": true}
+""".strip()
+
 
 prompt_template = """
-Username: {username}
-Full Name: {user_name}
-Comment: "{comment}"\n
-Is this spam?"""
+Comment: {comment_dict}\n
+Answer:"""
 
 
 async def start(update: Update, context):
     await update.message.reply_text("Bot is running and monitoring comments.")
 
 
-async def check_spam(user_name, username, comment):
+def retry(func, max_retries=3):
+    def wrapper(*args, **kwargs):
+        for i in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                logging.error(f"Retrying {func.__name__} failed: {e}")
+                if i == max_retries - 1:
+                    raise e
+
+    return wrapper
+
+
+def call_model_stack(prompt, stack=["gemini-1.5-pro", "gemini-1.5-flash-002"]):
+    for i, model_name in enumerate(stack):
+        try:
+            model = genai.GenerativeModel(
+                model_name,
+                system_instruction=system_instruction,
+                generation_config=genai.GenerationConfig(
+                    max_output_tokens=30,
+                ),
+            )
+            response = model.generate_content(prompt)
+            return response
+        except Exception as e:
+            logging.error(f"Failed to call {model_name}: {e}")
+            if i == len(stack) - 1:
+                logging.error(f"All models failed: {e}")
+                raise e
+            continue
+
+
+@retry
+async def check_spam(user_dict, comment_dict):
+    comment_dict = dict(comment_dict)
+
     prompt = prompt_template.format(
-        user_name=user_name[:100],
-        username=username[:100],
-        comment=comment[:500],
+        comment_dict=json.dumps(comment_dict, ensure_ascii=False)
     )
-    response = model.generate_content(prompt)
+    response = call_model_stack(prompt)
     result = response.text.strip().lower()
+    result = json.loads(result, strict=False)
     return prompt, result
 
 
-async def get_comment_info(update: Update, context):
-    logging.info(update)
-    logging.info(update.message)
-    logging.info(update.message.from_user)
+def truncate(text, max_length):
+    if len(text) > max_length:
+        return text[:max_length] + "..."
+    return text
 
-    if hasattr(update.message, "sender_chat") and update.message.sender_chat:
-        user_id = update.message.sender_chat.id
-        user_name = update.message.sender_chat.title
-        username = update.message.sender_chat.username
-    else:
-        user = update.message.from_user
-        user_id = user.id
-        user_name = user.full_name
-        username = f"@{user.username}" if user.username else "<No username>"
-    comment = update.message.text
 
-    return user_id, user_name, username, comment
+async def get_comment_info(
+    update: Update, context, treat_forward_origin_as_sender=False
+):
+    user_dict = None
+    if treat_forward_origin_as_sender:
+        if hasattr(update.message, "forward_origin") and update.message.forward_origin:
+            if hasattr(update.message.forward_origin, "sender_user"):
+                user_dict = update.message.forward_origin.sender_user.to_dict()
+
+    if user_dict is None:
+        if hasattr(update.message, "sender_chat") and update.message.sender_chat:
+            user_dict = update.message.sender_chat.to_dict()
+        else:
+            user = update.message.from_user
+            user_dict = user.to_dict()
+
+    assert user_dict is not None, f"Failed to get user dict for {update.message}"
+    comment_dict = update.message.to_dict()
+
+    delete_fields = [
+        "link_preview_options",
+        "chat",
+        "group_chat_created",
+        "channel_chat_created",
+        "delete_chat_photo",
+        "supergroup_chat_created",
+        "message_id",
+        "forward_origin",
+        "forward_date",
+        "forward_from",
+        "forward_from_chat",
+        "from",
+        "entities",
+        "message_thread_id",
+    ]
+    for field in delete_fields:
+        comment_dict.pop(field, None)
+
+    comment_dict["from_user"] = dict(user_dict)
+    comment_dict["from_user"].pop("is_bot", None)
+    comment_dict["from_user"].pop("id", None)
+
+    if comment_dict.get("reply_to_message"):
+        comment_dict["reply_to_message"]["caption"] = truncate(
+            comment_dict["reply_to_message"]["caption"], 500
+        )
+
+        drop_keys = []
+        for k in comment_dict["reply_to_message"]:
+            if k not in ["caption", "date"]:
+                drop_keys.append(k)
+        for k in drop_keys:
+            logging.info(f'{k}, {comment_dict["reply_to_message"][k]}')
+            del comment_dict["reply_to_message"][k]
+
+    if comment_dict.get("reply_to_message") and comment_dict.get("date"):
+        comment_delay = comment_dict["date"] - comment_dict["reply_to_message"]["date"]
+        comment_dict["comment_delay_seconds"] = comment_delay
+    return user_dict, comment_dict
+
+
+async def send_to(
+    context,
+    chat_id,
+    content: list[str | dict],
+):
+    message = []
+
+    for item in content:
+        if isinstance(item, str):
+            message.append(item)
+        else:
+            message.append(
+                f"<pre>{html.escape(json.dumps(item, ensure_ascii=False, indent=2))}</pre>"
+            )
+
+    message = "\n".join(message)
+    return await context.bot.send_message(
+        chat_id=chat_id, text=message, parse_mode=ParseMode.HTML
+    )
 
 
 async def handle_comment(update: Update, context):
-
     if update.effective_chat.id != int(TARGET_GROUP_ID):
         return
 
-    user = update.message.from_user
+    user_dict, comment_dict = await get_comment_info(update, context)
+    user_id = user_dict["id"]
 
-    user_id, user_name, username, comment = await get_comment_info(update, context)
-
-    logging.info(f"Comment from {user_name} @{username} {user_id}")
+    logging.info(f"Comment {user_dict}, {comment_dict}")
 
     if user_id in WHITELIST_IDS:
-        logging.info(f"User {user_name} @{username} is whitelisted.")
+        logging.info(f"User {user_dict} is whitelisted.")
         return
 
-    prompt, result = await check_spam(user_name, username, comment)
+    if user_dict.get("is_premium") is True:
+        logging.info(f"User {user_dict} is premium.")
+        return
+
+    prompt, result = await check_spam(user_dict, comment_dict)
     logging.info(f"Prompt:\n{prompt}\n\nResult:\n{result}")
 
-    if result == "spam":
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"Spam detected from {user_name} @{username}",
+    if result["spam"]:
+        await send_to(
+            context,
+            ADMIN_ID,
+            content=[
+                "Spam detected",
+                "User",
+                user_dict,
+                "Comment",
+                comment_dict,
+                "Result",
+                result,
+            ],
         )
         await context.bot.forward_message(
             chat_id=ADMIN_ID,
@@ -107,13 +240,63 @@ async def handle_private_message(update: Update, context):
     if update.effective_chat.id != int(ADMIN_ID):
         return
 
-    user_id, user_name, username, comment = await get_comment_info(update, context)
+    user_dict, comment_dict = await get_comment_info(
+        update, context, treat_forward_origin_as_sender=True
+    )
+    user_id = user_dict["id"]
 
     if user_id in WHITELIST_IDS:
         await update.message.reply_text("User is whitelisted.")
 
-    prompt, result = await check_spam(user_name, username, comment)
-    await update.message.reply_text(f"Prompt:\n{prompt}\n\nResult:\n{result}")
+    prompt, result = await check_spam(user_dict, comment_dict)
+
+    await send_to(
+        context,
+        update.effective_chat.id,
+        content=[
+            "User",
+            user_dict,
+            "Comment",
+            comment_dict,
+            "Prompt",
+            "---",
+            prompt,
+            "---",
+            "Result",
+            result,
+        ],
+    )
+
+
+async def error_handler(update: object, context) -> None:
+    """Log the error and send a telegram message to notify the developer."""
+    logging.error(msg="Exception while handling an update:", exc_info=context.error)
+
+    tb_list = traceback.format_exception(
+        None, context.error, context.error.__traceback__
+    )
+    tb_string = "".join(tb_list)
+
+    update_dict = update.to_dict() if isinstance(update, Update) else {}
+    if "message" in update_dict:
+        if "text" in update_dict["message"]:
+            update_dict["message"]["text"] = truncate(
+                update_dict["message"]["text"], 200
+            )
+
+    update_dict = update_dict or str(update)
+
+    await send_to(
+        context,
+        ADMIN_ID,
+        content=[
+            "Exception",
+            "Update",
+            update_dict,
+            "Traceback",
+            f"<pre>{html.escape(tb_string[-300:])}</pre>",
+        ],
+    )
 
 
 def main():
@@ -126,10 +309,10 @@ def main():
             handle_private_message,
         )
     )
+    application.add_error_handler(error_handler)
     logging.info("Starting bot")
     application.run_polling()
 
 
 if __name__ == "__main__":
-    main()
     main()
