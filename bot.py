@@ -1,10 +1,13 @@
 import asyncio
 import html
+import http.server
 import json
 import logging
 import os
+import socketserver
 import traceback
 from collections import Counter
+from threading import Thread
 
 import google.generativeai as genai
 from telegram import Update
@@ -308,7 +311,25 @@ async def error_handler(update: object, context) -> None:
     )
 
 
+class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+
+def run_health_check_server():
+    with socketserver.TCPServer(("", 8080), HealthCheckHandler) as httpd:
+        print("Health check server running on port 8080")
+        httpd.serve_forever()
+
+
 def main():
+    # Start health check server in a separate thread
+    health_check_thread = Thread(target=run_health_check_server, daemon=True)
+    health_check_thread.start()
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.ChatType.GROUPS, handle_comment))
