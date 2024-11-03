@@ -154,21 +154,30 @@ async def get_comment_info(
     comment_dict["from_user"].pop("id", None)
 
     if comment_dict.get("reply_to_message"):
-        comment_dict["reply_to_message"]["caption"] = truncate(
-            comment_dict["reply_to_message"]["caption"], 500
-        )
+        if "caption" in comment_dict["reply_to_message"]:
+            comment_dict["reply_to_message"]["caption"] = truncate(
+                comment_dict["reply_to_message"]["caption"], 500
+            )
+        if "text" in comment_dict["reply_to_message"]:
+            if "caption" in comment_dict["reply_to_message"]:
+                del comment_dict["reply_to_message"]["caption"]
+            comment_dict["reply_to_message"]["text"] = truncate(
+                comment_dict["reply_to_message"]["text"], 500
+            )
 
         drop_keys = []
         for k in comment_dict["reply_to_message"]:
             if k not in ["caption", "date"]:
                 drop_keys.append(k)
+        logging.info(f"Dropping keys: {drop_keys}")
         for k in drop_keys:
-            logging.info(f'{k}, {comment_dict["reply_to_message"][k]}')
             del comment_dict["reply_to_message"][k]
 
     if comment_dict.get("reply_to_message") and comment_dict.get("date"):
         comment_delay = comment_dict["date"] - comment_dict["reply_to_message"]["date"]
         comment_dict["comment_delay_seconds"] = comment_delay
+    if "text" in comment_dict:
+        comment_dict["text"] = truncate(comment_dict["text"], 1000)
     return user_dict, comment_dict
 
 
