@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    command: python bot.py
+    env_file:
+      - .env
+    restart: on-failure
+    volumes:
+      - .:/app
